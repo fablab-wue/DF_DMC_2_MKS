@@ -1,0 +1,40 @@
+Waveshare RP2040-Zero — DF_DMC_2_MKS pinout (USB at top)
+Defaults in src/config.h
+
+    function     pad                  pad    function
+                        +---- USB ----+
+  5V             5V     |o           o| GP0    DMX_TX
+  GND            GND    |o           o| GP1    SERVO_1
+  3V3            3V3    |o           o| GP2    SERVO_2
+  GIO_OUT0       GP29   |o           o| GP3    SERVO_3
+  GIO_OUT1       GP28   |o           o| GP4    SERVO_4
+  GIO_OUT2       GP27   |o           o| GP5    SERVO_5
+  GIO_OUT3       GP26   |o           o| GP6    SERVO_6
+  GIO_IN0        GP15   |o           o| GP7    SERVO_7
+  GIO_IN1        GP14   |o           o| GP8    SERVO_8
+                        +-------------+
+                         13 12 11 10 9
+
+Bottom edge (left→right):
+  GP13   RS485_RX
+  GP12   RS485_TX
+  GP11   RS485_DIR
+  GP10   BUZZER
+  GP9    CAMERA
+
+Bottom-side SMD pads (top→bottom):
+  GND    GND
+  GP25   DBG
+  GP24   DBG
+  GP23   DBG
+  GP22   DBG
+  GP21   DBG
+  GP20   DBG
+  GP19   DBG
+  GP18   DBG
+  GP17   DBG
+
+DMX_TX GP0 (PIO UART 250k 8N2). No DMX levels on servo PWM.
+SERVO_1..8 hobby PWM on GP1..GP8. RS485 256000 baud: TX GP12, RX GP13, DIR GP11.
+CAMERA GP9 (OC). BUZZER GP10. GIO OUT GP29..GP26. GIO IN GP15, GP14.
+GP16 = internal WS2812 status LED. GP17..GP25 are DBG pads (inputs, free for probes).
