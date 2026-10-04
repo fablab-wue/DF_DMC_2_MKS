@@ -34,6 +34,18 @@ DF_DMC_2_MKS  (RP2040-Zero)
 
 ---
 
+## Flash a release
+
+No compiler and no PlatformIO. Board: **Waveshare RP2040-Zero**.
+
+1. Download `DF_DMC_2_MKS-<tag>-rp2040zero.uf2` from the [Releases](https://github.com/fablab-wue/DF_DMC_2_MKS/releases) page.
+2. Hold **BOOTSEL**, plug in USB, then release BOOTSEL.
+3. Copy the UF2 onto the `RPI-RP2` drive. The board reboots into the new firmware.
+
+USB CDC is binary DMC, not a text console. A new file is built when a `v*` tag is pushed. That tag's commit must already contain this workflow. Rebuild an existing tag from the Actions page with **Run workflow**.
+
+---
+
 ## Quick start (VS Code)
 
 1. Install [VS Code](https://code.visualstudio.com/) and the **PlatformIO IDE** extension.

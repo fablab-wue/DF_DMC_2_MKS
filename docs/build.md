@@ -2,7 +2,19 @@
 
 [← Index](README.md)
 
-PlatformIO, same core as DF_DMC_2_MC: earlephilhower Arduino on `board = pico` (the Zero uses that upload). `lib_deps` links `../DF_DMC_Common`, so that repo must sit next to this one.
+PlatformIO, same core as DF_DMC_2_MC: earlephilhower Arduino on `board = pico` (the Zero uses that upload). `lib_deps` links `../DF_DMC_Common`, so that repo must sit next to this one before a source build.
+
+## Flash a release
+
+No compiler and no PlatformIO. Board: **Waveshare RP2040-Zero**.
+
+1. Download `DF_DMC_2_MKS-<tag>-rp2040zero.uf2` from the [Releases](https://github.com/fablab-wue/DF_DMC_2_MKS/releases) page.
+2. Hold **BOOTSEL**, plug in USB, then release BOOTSEL.
+3. Copy the UF2 onto the `RPI-RP2` drive. The board reboots into the new firmware.
+
+A new file is built when a `v*` tag is pushed. Rebuild an existing tag from the Actions page with **Run workflow**.
+
+## Source build
 
 ```text
 pio run -e rpipico
