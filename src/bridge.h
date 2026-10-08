@@ -9,6 +9,7 @@
 #include <dmx_engine.h>
 #include <gio_io.h>
 #include <path_table.h>
+#include <rt_support.h>
 
 namespace dfmks {
 
@@ -34,17 +35,21 @@ class DmcBridge {
   void maybeSendPositionReport();
   void maybeUnsolicitedGio();
   void maybeFinishPath();
-  void maybeRestoreBloop();
   void maybeUpdateShoot();
-  void clearShoot();
+  void endShoot(bool notify);
+  void noteCdc(bool up);
   void stopEverything();
   void commandFrame(int dfFrame, bool withDmx);
+  void commandPlayback(int dfFrame);
+  void moveToSample(double frameTime);
+  uint32_t poseFault(double frameTime, bool extrapolate) const;
+  bool rejectRunLimits(const dfdmc::RtRunMove& move, const dfdmc::RtPlaySpan& span, uint32_t id);
+  bool inRun(int frame) const;
   void applyProgramDmx(int dfFrame);
   void queueMksFrame(int dfFrame);
   void startArmedPlay();
   void handleShootFrame(const dfdmc::DmcFrame& frame);
   void handleShootFrame2(const dfdmc::DmcFrame& frame);
-  void fireBloop(unsigned ms);
   void applyFrameTrigger(int dfFrame);
   void pumpPendingPlay();
   void pumpPath();
@@ -75,16 +80,13 @@ class DmcBridge {
   int playDir_ = 1;
   int mksSentFrame_ = -1;
   uint32_t pathSliceUs_ = 41667;
-  uint32_t nextFrameMs_ = 0;
-  unsigned pendingBloopMs_ = 0;
-  uint16_t pendingBloopDmx_ = 0;
-  uint16_t bloopDmxChannel_ = 0;
-  uint8_t bloopSavedLevel_ = 0;
-  uint32_t bloopDmxUntilMs_ = 0;
-  bool bloopDmxOn_ = false;
-  uint32_t pendingPostrollMs_ = 0;
-  uint32_t postrollUntilMs_ = 0;
-  bool postrollWaiting_ = false;
+  uint32_t nextFrameUs_ = 0;
+  int runStart_ = 1;
+  int runEnd_ = 1;
+  dfdmc::BloopOut bloop_;
+  dfdmc::LiveShutter shutter_;
+  uint32_t lastStopAllMs_ = 0;
+  bool shootNeedsEnd_ = false;
   bool shootArmed_ = false;
   bool shootRun_ = false;
   bool shootShutter_ = false;

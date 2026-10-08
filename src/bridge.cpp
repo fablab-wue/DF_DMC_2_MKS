@@ -51,15 +51,7 @@ void DmcBridge::setup() {
 }
 
 void DmcBridge::loop() {
-  const bool cdc = static_cast<bool>(Serial);
-  if (cdcWasUp_ && !cdc) {
-    mks_.setHostAlive(false);
-    stopEverything();
-  } else if (cdc && !cdcWasUp_) {
-    mks_.setHostAlive(true);
-  }
-  cdcWasUp_ = cdc;
-
+  noteCdc(static_cast<bool>(Serial));
   maybeSendBootHello();
   while (Serial.available()) {
     const uint8_t byte = static_cast<uint8_t>(Serial.read());
@@ -75,7 +67,8 @@ void DmcBridge::loop() {
   servos_.update();
   maybeSendPositionReport();
   maybeUnsolicitedGio();
-  maybeRestoreBloop();
+  bloop_.tick(gio_, dmx_);
+  shutter_.tick(gio_);
   pumpPath();
   maybeFinishPath();
   maybeUpdateShoot();
@@ -94,7 +87,7 @@ void DmcBridge::sendDmcFrame(uint32_t id, uint16_t type, const std::vector<uint8
   packet.insert(packet.end(), payload.begin(), payload.end());
   const uint16_t rawChecksum = computeChecksum(packet.data(), packet.size());
   appendWordLE(packet, encodeChecksum(rawChecksum));
-  Serial.write(packet.data(), packet.size());
+  writeUsbFrame(packet.data(), packet.size());
 }
 
 void DmcBridge::sendDmcAck(uint32_t id, uint16_t type, uint32_t status) {
@@ -176,40 +169,34 @@ void DmcBridge::maybeUnsolicitedGio() {
   }
 }
 
-void DmcBridge::maybeRestoreBloop() {
-  if (!bloopDmxOn_) {
-    return;
+void DmcBridge::noteCdc(bool up) {
+  if (cdcWasUp_ && !up) {
+    mks_.setHostAlive(false);
+    dfConnected_ = false;
+    bootHelloSent_ = false;
+    dmcParser_.reset();
+    wasPathActive_ = false;
+    stopEverything();
+    shutter_.endMove(gio_);
+    bloop_.release(gio_, dmx_);
+  } else if (up && !cdcWasUp_) {
+    mks_.setHostAlive(true);
   }
-  if (static_cast<int32_t>(millis() - bloopDmxUntilMs_) < 0) {
-    return;
-  }
-  dmx_.apply(bloopDmxChannel_, &bloopSavedLevel_, 1, false);
-  bloopDmxOn_ = false;
+  cdcWasUp_ = up;
 }
 
 void DmcBridge::maybeFinishPath() {
   const bool active = pathActive_;
-  if (active) {
-    postrollWaiting_ = false;
-  } else if (wasPathActive_ && dfConnected_ && !shootRun_) {
-    if (pendingPostrollMs_ > 0) {
-      postrollUntilMs_ = millis() + pendingPostrollMs_;
-      pendingPostrollMs_ = 0;
-      postrollWaiting_ = true;
-    } else if (!postrollWaiting_) {
-      sendDmcFrame(0, kDmcMsgRtEnd, {});
-    }
-  }
-  if (postrollWaiting_ && static_cast<int32_t>(millis() - postrollUntilMs_) >= 0) {
-    postrollWaiting_ = false;
-    if (dfConnected_ && !shootRun_) {
-      sendDmcFrame(0, kDmcMsgRtEnd, {});
-    }
+  if (!active && wasPathActive_ && dfConnected_ && !shootRun_ && !shootArmed_) {
+    shutter_.endMove(gio_);
+    bloop_.release(gio_, dmx_);
+    sendDmcFrame(0, kDmcMsgRtEnd, {});
   }
   wasPathActive_ = active;
 }
 
-void DmcBridge::clearShoot() {
+void DmcBridge::endShoot(bool notify) {
+  const bool pending = shootNeedsEnd_;
   if (shootShutter_) {
     gio_.setCameraShutter(false);
     shootShutter_ = false;
@@ -217,6 +204,10 @@ void DmcBridge::clearShoot() {
   shootArmed_ = false;
   shootRun_ = false;
   mksBlurSent_ = false;
+  shootNeedsEnd_ = false;
+  if (notify && pending && dfConnected_) {
+    sendDmcFrame(0, kDmcMsgRtEnd, {});
+  }
 }
 
 void DmcBridge::stopEverything() {
@@ -224,8 +215,88 @@ void DmcBridge::stopEverything() {
   pendingPlay_ = false;
   armedPlay_ = false;
   mks_.setPositionPoll(true);
-  clearShoot();
+  endShoot(false);
   servos_.stopMotion();
+}
+
+void DmcBridge::commandPlayback(int dfFrame) {
+  currentFrame_ = dfFrame;
+  bool any = false;
+  for (int a = 0; a < kMksAxes; ++a) {
+    if (mks_.moveAxis(a, path_.sampleSteps(a, static_cast<double>(dfFrame), true))) {
+      any = true;
+    }
+  }
+  if (any) {
+    mks_.finishGroup();
+  }
+  for (int s = 0; s < kServoAxes; ++s) {
+    servos_.moveToSteps(s, path_.sampleSteps(kMksAxes + s, static_cast<double>(dfFrame), true));
+  }
+  mksSentFrame_ = dfFrame;
+  if (syncDmx_) {
+    applyProgramDmx(dfFrame);
+  }
+  applyFrameTrigger(dfFrame);
+}
+
+void DmcBridge::moveToSample(double frameTime) {
+  pathActive_ = false;
+  pendingPlay_ = false;
+  mks_.setPositionPoll(true);
+  bool any = false;
+  for (int a = 0; a < kMksAxes; ++a) {
+    if (mks_.moveAxis(a, path_.sampleSteps(a, frameTime, true))) {
+      any = true;
+    }
+  }
+  if (any) {
+    mks_.finishGroup();
+  }
+  for (int s = 0; s < kServoAxes; ++s) {
+    servos_.moveToSteps(s, path_.sampleSteps(kMksAxes + s, frameTime, true));
+  }
+  currentFrame_ = static_cast<int>(lround(frameTime));
+}
+
+uint32_t DmcBridge::poseFault(double frameTime, bool extrapolate) const {
+  for (int a = 0; a < kAxisCount; ++a) {
+    const int32_t steps = path_.sampleSteps(a, frameTime, extrapolate);
+    const uint32_t fault = a < kMksAxes ? mks_.limitFault(a, steps) : servos_.limitFault(a - kMksAxes, steps);
+    if (fault != 0) {
+      return fault;
+    }
+  }
+  return 0;
+}
+
+bool DmcBridge::rejectRunLimits(const RtRunMove& move, const RtPlaySpan& span, uint32_t id) {
+  if (poseFault(span.prerollFrame, true) != 0) {
+    sendDmcAck(id, kDmcMsgRtRunMove, kDmcAckErrPreroll);
+    return true;
+  }
+  if (poseFault(span.postrollFrame, true) != 0) {
+    sendDmcAck(id, kDmcMsgRtRunMove, kDmcAckErrPostroll);
+    return true;
+  }
+  const int lo = move.startFrame < move.endFrame ? move.startFrame : move.endFrame;
+  const int hi = move.startFrame < move.endFrame ? move.endFrame : move.startFrame;
+  const int from = lo > path_.startFrame() ? lo : path_.startFrame();
+  const int to = hi < path_.endFrame() ? hi : path_.endFrame();
+  for (int f = from; f <= to; ++f) {
+    const uint32_t fault = poseFault(static_cast<double>(f), false);
+    if (fault != 0) {
+      sendDmcAck(id, kDmcMsgRtRunMove, fault);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool DmcBridge::inRun(int frame) const {
+  const int lo = runStart_ < runEnd_ ? runStart_ : runEnd_;
+  const int hi = runStart_ < runEnd_ ? runEnd_ : runStart_;
+  return frame >= lo && frame <= hi;
 }
 
 void DmcBridge::applyProgramDmx(int dfFrame) {
@@ -276,28 +347,18 @@ void DmcBridge::commandFrame(int dfFrame, bool withDmx) {
 }
 
 void DmcBridge::startArmedPlay() {
-  if (pendingBloopMs_ > 0) {
-    fireBloop(pendingBloopMs_);
-    if (pendingBloopDmx_ >= 1 && pendingBloopDmx_ <= kDmxChannels) {
-      if (bloopDmxOn_) {
-        dmx_.apply(bloopDmxChannel_, &bloopSavedLevel_, 1, false);
-      }
-      bloopDmxChannel_ = pendingBloopDmx_;
-      bloopSavedLevel_ = dmx_.levelAt(bloopDmxChannel_);
-      const uint8_t full = 255;
-      dmx_.apply(bloopDmxChannel_, &full, 1, false);
-      bloopDmxUntilMs_ = millis() + pendingBloopMs_;
-      bloopDmxOn_ = true;
-    }
-  }
   playEndFrame_ = pendingEnd_;
   playDir_ = pendingStart_ <= pendingEnd_ ? 1 : -1;
-  currentFrame_ = pendingStart_;
+  commandPlayback(pendingStart_);
+  bloop_.fire(gio_, dmx_);
+  shutter_.beginMove(gio_);
+  if (inRun(pendingStart_)) {
+    shutter_.beginFrame(gio_);
+  }
   pathActive_ = true;
   mks_.setPositionPoll(false);
-  const uint32_t sliceMs = pathSliceUs_ / 1000u;
-  nextFrameMs_ = millis() + (sliceMs == 0 ? 1 : sliceMs);
-  sendMotorPositions(0, currentFrame_);
+  nextFrameUs_ = micros() + pathSliceUs_;
+  sendMotorPositions(0, static_cast<int32_t>(moveTimeThousandths(currentFrame_)));
 }
 
 void DmcBridge::maybeUpdateShoot() {
@@ -326,7 +387,7 @@ void DmcBridge::maybeUpdateShoot() {
     shootShutter_ = false;
   }
   if (elapsed >= shootDoneMs_ && !mks_.moving() && !servos_.moving()) {
-    shootRun_ = false;
+    endShoot(true);
   }
 }
 
@@ -454,6 +515,7 @@ void DmcBridge::handleShootFrame(const DmcFrame& frame) {
   shootRun_ = false;
   mksBlurSent_ = false;
   shootArmed_ = true;
+  shootNeedsEnd_ = true;
   sendDmcAck(frame.id, frame.type, kDmcAckOk);
 }
 
@@ -572,14 +634,8 @@ void DmcBridge::handleShootFrame2(const DmcFrame& frame) {
   shootRun_ = false;
   mksBlurSent_ = false;
   shootArmed_ = true;
+  shootNeedsEnd_ = true;
   sendDmcAck(frame.id, frame.type, kDmcAckOk);
-}
-
-void DmcBridge::fireBloop(unsigned ms) {
-  if (ms == 0) {
-    ms = 100;
-  }
-  gio_.pulseBuzzer(ms);
 }
 
 void DmcBridge::applyFrameTrigger(int dfFrame) {
@@ -587,7 +643,7 @@ void DmcBridge::applyFrameTrigger(int dfFrame) {
   if (path_.triggerMask() == 0 || !path_.localFrame(dfFrame, &local)) {
     return;
   }
-  gio_.setOutputs(path_.triggerAtLocal(local));
+  gio_.setOutputs(path_.triggerAtLocal(local) | bloop_.heldOutputs());
 }
 
 void DmcBridge::pumpPendingPlay() {
@@ -601,28 +657,7 @@ void DmcBridge::pumpPendingPlay() {
     return;
   }
   pendingPlay_ = false;
-  if (pendingBloopMs_ > 0) {
-    fireBloop(pendingBloopMs_);
-    if (pendingBloopDmx_ >= 1 && pendingBloopDmx_ <= kDmxChannels) {
-      if (bloopDmxOn_) {
-        dmx_.apply(bloopDmxChannel_, &bloopSavedLevel_, 1, false);
-      }
-      bloopDmxChannel_ = pendingBloopDmx_;
-      bloopSavedLevel_ = dmx_.levelAt(bloopDmxChannel_);
-      const uint8_t full = 255;
-      dmx_.apply(bloopDmxChannel_, &full, 1, false);
-      bloopDmxUntilMs_ = millis() + pendingBloopMs_;
-      bloopDmxOn_ = true;
-    }
-  }
-  commandFrame(pendingStart_, syncDmx_);
-  playEndFrame_ = pendingEnd_;
-  playDir_ = pendingStart_ <= pendingEnd_ ? 1 : -1;
-  pathActive_ = true;
-  mks_.setPositionPoll(false);
-  const uint32_t sliceMs = pathSliceUs_ / 1000u;
-  nextFrameMs_ = millis() + (sliceMs == 0 ? 1 : sliceMs);
-  sendMotorPositions(0, pendingStart_);
+  startArmedPlay();
 }
 
 void DmcBridge::pumpPath() {
@@ -630,12 +665,11 @@ void DmcBridge::pumpPath() {
   if (!pathActive_) {
     return;
   }
-  const uint32_t now = millis();
-  const uint32_t sliceMs = pathSliceUs_ / 1000u == 0 ? 1 : pathSliceUs_ / 1000u;
-  if (static_cast<int32_t>(now - nextFrameMs_) >= 0) {
-    nextFrameMs_ += sliceMs;
-    if (static_cast<int32_t>(now - nextFrameMs_) > static_cast<int32_t>(sliceMs)) {
-      nextFrameMs_ = now;
+  const uint32_t now = micros();
+  if (static_cast<int32_t>(now - nextFrameUs_) >= 0) {
+    nextFrameUs_ += pathSliceUs_;
+    if (static_cast<int32_t>(now - nextFrameUs_) > static_cast<int32_t>(pathSliceUs_)) {
+      nextFrameUs_ = now;
     }
     const int next = currentFrame_ + playDir_;
     const bool done = playDir_ > 0 ? next > playEndFrame_ : next < playEndFrame_;
@@ -645,34 +679,27 @@ void DmcBridge::pumpPath() {
       mks_.setPositionPoll(true);
       return;
     }
-    currentFrame_ = next;
-    int local = 0;
-    if (path_.localFrame(next, &local)) {
-      for (int s = 0; s < kServoAxes; ++s) {
-        servos_.moveToSteps(s, path_.positionSteps(kMksAxes + s, local));
-      }
+    commandPlayback(next);
+    if (inRun(next)) {
+      shutter_.beginFrame(gio_);
     }
-    if (syncDmx_) {
-      applyProgramDmx(next);
-    }
-    applyFrameTrigger(next);
-    sendMotorPositions(0, next);
+    sendMotorPositions(0, static_cast<int32_t>(moveTimeThousandths(next)));
   }
   if (mks_.idle() && mksSentFrame_ != currentFrame_) {
-    queueMksFrame(currentFrame_);
+    bool any = false;
+    for (int a = 0; a < kMksAxes; ++a) {
+      if (mks_.moveAxis(a, path_.sampleSteps(a, static_cast<double>(currentFrame_), true))) {
+        any = true;
+      }
+    }
+    if (any) {
+      mks_.finishGroup();
+    }
+    mksSentFrame_ = currentFrame_;
   }
 }
 
-uint32_t DmcBridge::psFromFpsX1000(uint32_t fpsX1000) const {
-  if (fpsX1000 < 1) {
-    fpsX1000 = 24000;
-  }
-  uint32_t us = (1000000000UL + (fpsX1000 / 2)) / fpsX1000;
-  if (us < 1000) {
-    us = 1000;
-  }
-  return us;
-}
+uint32_t DmcBridge::psFromFpsX1000(uint32_t fpsX1000) const { return framePeriodUs(fpsX1000); }
 
 void DmcBridge::handleDmcFrame(const DmcFrame& frame) {
   if (!frame.valid) {
@@ -711,38 +738,17 @@ void DmcBridge::handleDmcFrame(const DmcFrame& frame) {
       break;
     }
     case kDmcMsgDmx: {
-      uint8_t ramp = 0;
-      uint16_t channel = 1;
-      uint16_t count = 0;
-      const uint8_t* levels = nullptr;
-      bool parsed = false;
-      if (frame.payload.size() >= 7) {
-        uint32_t channel32 = 0;
-        uint16_t counted = 0;
-        uint8_t rampByte = 0;
-        if (readDwordLE(frame.payload, 0, &channel32) && readWordLE(frame.payload, 4, &counted) &&
-            readByte(frame.payload, 6, &rampByte) && counted > 0 && 7u + counted == frame.payload.size() &&
-            channel32 >= 1 && channel32 <= static_cast<uint32_t>(kDmxChannels)) {
-          channel = static_cast<uint16_t>(channel32);
-          count = counted;
-          ramp = rampByte;
-          levels = frame.payload.data() + 7;
-          parsed = true;
-        }
+      LiveDmx live;
+      const LiveDmxStatus st = parseLiveDmx(frame.payload, &live);
+      if (st == LiveDmxStatus::kGeneral) {
+        sendDmcAck(frame.id, frame.type, kDmcAckErrGeneral);
+        break;
       }
-      if (!parsed) {
-        if (frame.payload.size() < 4 || !readByte(frame.payload, 0, &ramp) || !readWordLE(frame.payload, 1, &channel)) {
-          sendDmcAck(frame.id, frame.type, kDmcAckErrGeneral);
-          break;
-        }
-        count = static_cast<uint16_t>(frame.payload.size() - 3);
-        levels = frame.payload.data() + 3;
-      }
-      if (channel < 1 || channel > kDmxChannels || count == 0) {
+      if (st == LiveDmxStatus::kRange) {
         sendDmcAck(frame.id, frame.type, kDmcAckErrRange);
         break;
       }
-      dmx_.apply(channel, levels, count, ramp != 0);
+      dmx_.apply(live.channel, live.levels, live.count, live.ramp);
       sendDmcAck(frame.id, frame.type, kDmcAckOk);
       break;
     }
@@ -750,7 +756,11 @@ void DmcBridge::handleDmcFrame(const DmcFrame& frame) {
       sendMotorStatus(frame.id);
       break;
     case kDmcMsgMotorGetPosition:
-      sendMotorPositions(frame.id);
+      if (pathActive_) {
+        sendMotorPositions(frame.id, static_cast<int32_t>(moveTimeThousandths(currentFrame_)));
+      } else {
+        sendMotorPositions(frame.id);
+      }
       break;
     default:
       handleMotorOrRt(frame);
@@ -772,10 +782,21 @@ void DmcBridge::handleMotorOrRt(const DmcFrame& frame) {
         sendDmcAck(frame.id, frame.type, kDmcAckErrRange);
         break;
       }
+      const uint32_t fault = isMks(motor) ? mks_.limitFault(motor - 1, position)
+                                         : servos_.limitFault(motor - 1 - kMksAxes, position);
+      if (fault != 0) {
+        sendDmcAck(frame.id, frame.type, fault);
+        break;
+      }
       pathActive_ = false;
       armedPlay_ = false;
       mks_.setPositionPoll(true);
-      clearShoot();
+      if (shootNeedsEnd_) {
+        endShoot(true);
+        wasPathActive_ = false;
+      }
+      shutter_.endMove(gio_);
+      bloop_.release(gio_, dmx_);
       if (isMks(motor)) {
         mks_.moveAxis(motor - 1, position);
         mks_.finishGroup();
@@ -798,7 +819,12 @@ void DmcBridge::handleMotorOrRt(const DmcFrame& frame) {
       pathActive_ = false;
       armedPlay_ = false;
       mks_.setPositionPoll(true);
-      clearShoot();
+      if (shootNeedsEnd_) {
+        endShoot(true);
+        wasPathActive_ = false;
+      }
+      shutter_.endMove(gio_);
+      bloop_.release(gio_, dmx_);
       if (isMks(motor)) {
         mks_.stopAxis(motor - 1);
       } else {
@@ -809,25 +835,32 @@ void DmcBridge::handleMotorOrRt(const DmcFrame& frame) {
       break;
     }
     case kDmcMsgMotorStopAll:
+    case kDmcMsgMotorHardStop: {
+      const uint32_t now = millis();
+      const bool hard = frame.type == kDmcMsgMotorHardStop ||
+                        (lastStopAllMs_ != 0 && static_cast<uint32_t>(now - lastStopAllMs_) < kDmcStopAllHardMs);
+      if (frame.type == kDmcMsgMotorStopAll) {
+        lastStopAllMs_ = now;
+      }
       pathActive_ = false;
       armedPlay_ = false;
       mks_.setPositionPoll(true);
-      clearShoot();
-      mks_.stopAll();
+      if (shootNeedsEnd_) {
+        endShoot(true);
+        wasPathActive_ = false;
+      }
+      shutter_.endMove(gio_);
+      bloop_.release(gio_, dmx_);
+      if (hard) {
+        mks_.hardStop();
+      } else {
+        mks_.stopAll();
+      }
       servos_.stopMotion();
       sendDmcAck(frame.id, frame.type, kDmcAckOk);
       sendMotorPositions(frame.id);
       break;
-    case kDmcMsgMotorHardStop:
-      pathActive_ = false;
-      armedPlay_ = false;
-      mks_.setPositionPoll(true);
-      clearShoot();
-      mks_.hardStop();
-      servos_.stopMotion();
-      sendDmcAck(frame.id, frame.type, kDmcAckOk);
-      sendMotorPositions(frame.id);
-      break;
+    }
     case kDmcMsgMotorResetPosition: {
       uint8_t motor = 0;
       int32_t position = 0;
@@ -865,10 +898,21 @@ void DmcBridge::handleMotorOrRt(const DmcFrame& frame) {
         sendDmcAck(frame.id, frame.type, kDmcAckErrRange);
         break;
       }
+      const uint32_t fault = isMks(motor) ? mks_.limitFault(motor - 1, destination)
+                                         : servos_.limitFault(motor - 1 - kMksAxes, destination);
+      if (fault != 0) {
+        sendDmcAck(frame.id, frame.type, fault);
+        break;
+      }
       pathActive_ = false;
       armedPlay_ = false;
       mks_.setPositionPoll(true);
-      clearShoot();
+      if (shootNeedsEnd_) {
+        endShoot(true);
+        wasPathActive_ = false;
+      }
+      shutter_.endMove(gio_);
+      bloop_.release(gio_, dmx_);
       if (speed == 0) {
         speed = 1;
       }
@@ -1042,59 +1086,39 @@ void DmcBridge::handleMotorOrRt(const DmcFrame& frame) {
       commandFrame(frameNo, true);
       sendDmcAck(frame.id, frame.type, kDmcAckOk);
       lastPositionTxMs_ = millis();
-      sendMotorPositions(frame.id, frameNo);
+      sendMotorPositions(frame.id, static_cast<int32_t>(moveTimeThousandths(frameNo)));
       break;
     }
     case kDmcMsgRtRunMove: {
-      uint32_t fpsX1000 = 24000;
-      int32_t startFrame = 1;
-      int32_t endFrame = 1;
-      uint32_t prerollMs = 0;
-      uint32_t postrollMs = 0;
-      uint8_t syncDmx = 0;
-      uint32_t bloopLoc = 0;
-      uint16_t bloopDmx = 0;
-      uint16_t bloopTime = 0;
-      if (frame.payload.size() < 20 || !readDwordLE(frame.payload, 0, &fpsX1000) ||
-          !readSignedDwordLE(frame.payload, 4, &startFrame) || !readSignedDwordLE(frame.payload, 8, &endFrame)) {
+      RtRunMove move;
+      if (!parseRtRunMove(frame.payload, &move)) {
         sendDmcAck(frame.id, frame.type, kDmcAckErrGeneral);
         break;
-      }
-      if (frame.payload.size() >= 24) {
-        readDwordLE(frame.payload, 12, &prerollMs);
-      }
-      if (frame.payload.size() >= 28) {
-        readDwordLE(frame.payload, 16, &postrollMs);
-      }
-      if (frame.payload.size() >= 29) {
-        readByte(frame.payload, 20, &syncDmx);
-      }
-      (void)prerollMs;
-      syncDmx_ = syncDmx != 0;
-      if (frame.payload.size() >= 33) {
-        readDwordLE(frame.payload, 21, &bloopLoc);
-      }
-      if (frame.payload.size() >= 35) {
-        readWordLE(frame.payload, 25, &bloopDmx);
-      }
-      if (frame.payload.size() >= 37) {
-        readWordLE(frame.payload, 27, &bloopTime);
       }
       if (path_.empty()) {
         sendDmcAck(frame.id, frame.type, kDmcAckErrGeneral);
         break;
       }
-      pathSliceUs_ = psFromFpsX1000(fpsX1000);
-      pathActive_ = false;
+      RtPlaySpan span;
+      rtPlaySpan(move, &span);
+      if (rejectRunLimits(move, span, frame.id)) {
+        break;
+      }
+      pathSliceUs_ = psFromFpsX1000(move.fpsX1000);
+      wasPathActive_ = false;
+      moveToSample(span.prerollFrame);
+      syncDmx_ = move.syncDmx;
+      runStart_ = move.startFrame;
+      runEnd_ = move.endFrame;
+      pendingStart_ = span.playFrom;
+      pendingEnd_ = span.playTo;
+      bloop_.release(gio_, dmx_);
+      shutter_.endMove(gio_);
+      bloop_.arm(move.bloopLocation, move.bloopDmx, move.bloopTimeMs);
+      shutter_.arm(move.flags, move.cameraOpen, move.cameraClose, framePeriodUs(move.fpsX1000));
       pendingPlay_ = false;
       armedPlay_ = true;
-      commandFrame(startFrame, syncDmx_);
-      pendingStart_ = startFrame;
-      pendingEnd_ = endFrame;
-      pendingBloopMs_ = (bloopLoc != 0 || bloopTime != 0) ? (bloopTime == 0 ? 100 : bloopTime) : 0;
-      pendingBloopDmx_ = bloopDmx;
-      pendingPostrollMs_ = postrollMs;
-      postrollWaiting_ = false;
+      endShoot(true);
       sendDmcAck(frame.id, frame.type, kDmcAckOk);
       break;
     }
@@ -1139,7 +1163,10 @@ void DmcBridge::handleMotorOrRt(const DmcFrame& frame) {
       }
       pendingStart_ = path_.startFrame();
       pendingEnd_ = path_.endFrame();
-      pendingBloopMs_ = 0;
+      runStart_ = pendingStart_;
+      runEnd_ = pendingEnd_;
+      bloop_.release(gio_, dmx_);
+      shutter_.endMove(gio_);
       pendingPlayAtMs_ = millis();
       pendingPlay_ = true;
       sendDmcAck(frame.id, frame.type, kDmcAckOk);
@@ -1163,7 +1190,10 @@ void DmcBridge::handleMotorOrRt(const DmcFrame& frame) {
       pathSliceUs_ = psFromFpsX1000(fpsX1000);
       pendingStart_ = from;
       pendingEnd_ = dest;
-      pendingBloopMs_ = 0;
+      runStart_ = from;
+      runEnd_ = dest;
+      bloop_.release(gio_, dmx_);
+      shutter_.endMove(gio_);
       pendingPlayAtMs_ = millis();
       pendingPlay_ = true;
       sendDmcAck(frame.id, frame.type, kDmcAckOk);

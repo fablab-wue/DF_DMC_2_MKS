@@ -24,6 +24,7 @@ class ServoBank {
   void stopMotion();
   void configure(int axis0, uint8_t flags);
   void setLimits(int axis0, bool lowerEn, int32_t lower, bool upperEn, int32_t upper);
+  uint32_t limitFault(int axis0, int32_t steps) const;
   int32_t positionSteps(int axis0) const;
   uint32_t movingMask() const { return movingMask_; }
   bool moving() const { return movingMask_ != 0; }

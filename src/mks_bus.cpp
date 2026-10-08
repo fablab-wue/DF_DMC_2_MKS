@@ -577,6 +577,13 @@ void MksBus::setSpeed(int axis0, int32_t stepsPerSec, int32_t stepsPerSec2) {
   acc_[axis0] = accFromStepsPerSec2(stepsPerSec2);
 }
 
+uint32_t MksBus::limitFault(int axis0, int32_t steps) const {
+  if (axis0 < 0 || axis0 >= kMksAxes) {
+    return 0;
+  }
+  return dfdmc::softLimitFault(lowerEn_[axis0], lower_[axis0], upperEn_[axis0], upper_[axis0], steps);
+}
+
 void MksBus::setLimits(int axis0, bool lowerEn, int32_t lower, bool upperEn, int32_t upper) {
   if (axis0 < 0 || axis0 >= kMksAxes) {
     return;

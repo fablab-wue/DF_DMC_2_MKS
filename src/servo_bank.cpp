@@ -292,6 +292,13 @@ void ServoBank::configure(int axis0, uint8_t flags) {
   writeAxis(axis0);
 }
 
+uint32_t ServoBank::limitFault(int axis0, int32_t steps) const {
+  if (axis0 < 0 || axis0 >= kServoAxes) {
+    return 0;
+  }
+  return dfdmc::softLimitFault(lowerEn_[axis0], lower_[axis0], upperEn_[axis0], upper_[axis0], steps);
+}
+
 void ServoBank::setLimits(int axis0, bool lowerEn, int32_t lower, bool upperEn, int32_t upper) {
   if (axis0 < 0 || axis0 >= kServoAxes) {
     return;
